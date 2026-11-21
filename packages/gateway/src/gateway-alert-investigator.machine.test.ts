@@ -1,10 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import { type GatewayAlertRecord, noIncident } from "./gateway-alert-investigator.context";
-import { gatewayAlertInvestigator as machine } from "./gateway-alert-investigator.machine";
+import { gatewayAlertInvestigator as xstateMachine } from "./gateway-alert-investigator.machine";
+import { gatewayAlertInvestigator as nativeMachine } from "./gateway-alert-investigator.native";
 
-type Snapshot = ReturnType<typeof machine.getInitialSnapshot>;
-type Event = Parameters<typeof machine.transition>[1];
+type Snapshot = ReturnType<typeof nativeMachine.getInitialSnapshot>;
+type Event = Parameters<typeof nativeMachine.transition>[1];
 type Phase = Snapshot["value"];
+
+// Both generated modules come from the same .lucy source, and every test runs
+// against each, so any difference between them fails a test.
+const machines = [
+  ["ts-native", nativeMachine],
+  ["xstate v6", xstateMachine],
+] as const;
 
 const t0 = "2026-01-01T00:00:00.000Z";
 const t1 = "2026-01-01T00:01:00.000Z";
@@ -31,9 +39,6 @@ function at(value: Phase, context: Partial<GatewayAlertRecord> = {}): Snapshot {
   };
 }
 
-function send(snapshot: Snapshot, event: Event): Snapshot {
-  return machine.transition(snapshot, event)[0];
-}
 
 const alert = (
   now: string,
@@ -45,7 +50,11 @@ const alert = (
   incidentId,
 });
 
-describe("gatewayAlertInvestigator machine", () => {
+describe.each(machines)("gatewayAlertInvestigator machine (%s)", (_target, machine) => {
+  function send(snapshot: Snapshot, event: Event): Snapshot {
+    return machine.transition(snapshot, event)[0];
+  }
+
   test("starts idle with no incident", () => {
     const initial = machine.getInitialSnapshot();
     expect(initial.value).toBe("idle");

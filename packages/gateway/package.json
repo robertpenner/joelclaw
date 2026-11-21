@@ -38,7 +38,8 @@
     "remark-gfm": "^4.0.1",
     "remark-parse": "^11.0.0",
     "unified": "^11.0.5",
-    "xstate": "5.31.1"
+    "xstate": "5.31.1",
+    "xstate-v6": "npm:xstate@6.0.0-beta.3"
   },
   "devDependencies": {
     "@types/bun": "latest",
