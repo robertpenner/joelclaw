@@ -2,95 +2,24 @@ import { mkdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/pr
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
-import { createActor, createMachine } from "xstate";
+import {
+  type GatewayAlertKind,
+  type GatewayAlertRecord,
+  incidentName,
+} from "./gateway-alert-investigator.context";
+import { gatewayAlertInvestigator } from "./gateway-alert-investigator.machine";
 
-export type GatewayAlertKind = "missing" | "stale";
-export type GatewayAlertPhase =
-  | "idle"
-  | "ensuringHerdr"
-  | "openingWorkspace"
-  | "startingAgent"
-  | "promptingAgent"
-  | "investigating"
-  | "blocked"
-  | "recovering"
-  | "recoveryBlocked"
-  | "recovered";
+export type { GatewayAlertKind } from "./gateway-alert-investigator.context";
 
+type GatewayAlertSnapshot = ReturnType<typeof gatewayAlertInvestigator.getInitialSnapshot>;
+type GatewayAlertEvent = Parameters<typeof gatewayAlertInvestigator.transition>[1];
+export type GatewayAlertPhase = GatewayAlertSnapshot["value"];
+
+/** The stored form of the machine's snapshot. */
 export type GatewayAlertIncident = {
   readonly version: 1;
   readonly phase: GatewayAlertPhase;
-  readonly incidentId: string;
-  readonly kind: GatewayAlertKind;
-  readonly ageSeconds?: number;
-  readonly createdAt: string;
-  readonly updatedAt: string;
-  readonly attempt: number;
-  readonly attemptStartedAt: string;
-  readonly retryAfter?: string;
-  readonly workspaceId?: string;
-  readonly paneId?: string;
-  readonly agentName?: string;
-  readonly lastError?: string;
-  readonly recoveredAt?: string;
-};
-
-type GatewayAlertEvent =
-  | { readonly type: "ALERT" }
-  | { readonly type: "HERDR_READY" }
-  | { readonly type: "WORKSPACE_READY" }
-  | { readonly type: "AGENT_READY" }
-  | { readonly type: "PROMPT_ACCEPTED" }
-  | { readonly type: "FAILED" }
-  | { readonly type: "RETRY" }
-  | { readonly type: "WORKSPACE_LOST" }
-  | { readonly type: "AGENT_LOST" }
-  | { readonly type: "BEGIN_RECOVERY" }
-  | { readonly type: "RECOVERY_DELIVERED" }
-  | { readonly type: "RECOVERY_FAILED" }
-  | { readonly type: "RETRY_RECOVERY" };
-
-export const gatewayAlertInvestigatorMachine = createMachine({
-  id: "gatewayAlertInvestigator",
-  initial: "idle",
-  states: {
-    idle: { on: { ALERT: "ensuringHerdr" } },
-    ensuringHerdr: {
-      on: { HERDR_READY: "openingWorkspace", FAILED: "blocked", BEGIN_RECOVERY: "recovering" },
-    },
-    openingWorkspace: {
-      on: { WORKSPACE_READY: "startingAgent", FAILED: "blocked", BEGIN_RECOVERY: "recovering" },
-    },
-    startingAgent: {
-      on: { AGENT_READY: "promptingAgent", FAILED: "blocked", BEGIN_RECOVERY: "recovering" },
-    },
-    promptingAgent: {
-      on: { PROMPT_ACCEPTED: "investigating", FAILED: "blocked", BEGIN_RECOVERY: "recovering" },
-    },
-    investigating: {
-      on: {
-        ALERT: "investigating",
-        WORKSPACE_LOST: "ensuringHerdr",
-        AGENT_LOST: "startingAgent",
-        BEGIN_RECOVERY: "recovering",
-      },
-    },
-    blocked: {
-      on: { ALERT: "blocked", RETRY: "ensuringHerdr", BEGIN_RECOVERY: "recovering" },
-    },
-    recovering: {
-      on: {
-        RECOVERY_DELIVERED: "recovered",
-        RECOVERY_FAILED: "recoveryBlocked",
-        ALERT: "ensuringHerdr",
-      },
-    },
-    recoveryBlocked: {
-      on: { RETRY_RECOVERY: "recovering", ALERT: "ensuringHerdr" },
-    },
-    recovered: { on: { ALERT: "ensuringHerdr" } },
-  },
-});
+} & GatewayAlertRecord;
 
 export type CommandResult = {
   readonly exitCode: number;
@@ -139,21 +68,29 @@ const DEFAULT_RETRY_MS = 5 * 60_000;
 const LOCK_STALE_MS = 2 * 60_000;
 const LOCK_HEARTBEAT_MS = 10_000;
 
-function transitionIncident(
-  incident: GatewayAlertIncident,
-  event: GatewayAlertEvent,
-  patch: Partial<GatewayAlertIncident> = {},
-): GatewayAlertIncident {
-  const actor = createActor(gatewayAlertInvestigatorMachine, {
-    snapshot: gatewayAlertInvestigatorMachine.resolveState({
-      value: incident.phase,
-      context: {},
-    }),
-  }).start();
-  actor.send(event);
-  const phase = String(actor.getSnapshot().value) as GatewayAlertPhase;
-  actor.stop();
-  return { ...incident, ...patch, phase };
+// `ts-native` exports no list of state names, and its `transition` returns
+// undefined for an unknown one, so stored phases are checked against this.
+const phases: Record<GatewayAlertPhase, true> = {
+  idle: true,
+  ensuringHerdr: true,
+  openingWorkspace: true,
+  startingAgent: true,
+  promptingAgent: true,
+  investigating: true,
+  blocked: true,
+  recovering: true,
+  recoveryBlocked: true,
+  recovered: true,
+};
+
+function snapshotOf(incident: GatewayAlertIncident | undefined): GatewayAlertSnapshot {
+  if (!incident) return gatewayAlertInvestigator.getInitialSnapshot();
+  const { version: _version, phase, ...record } = incident;
+  return { status: "active", value: phase, context: record, output: undefined, error: undefined };
+}
+
+function incidentOf(snapshot: GatewayAlertSnapshot): GatewayAlertIncident {
+  return { version: 1, phase: snapshot.value, ...snapshot.context };
 }
 
 function cleanDefaultHerdrEnvironment(): Record<string, string | undefined> {
@@ -251,7 +188,7 @@ function parseHerdrResult(stdout: string): Record<string, unknown> {
 async function readIncident(path: string): Promise<GatewayAlertIncident | undefined> {
   try {
     const parsed = JSON.parse(await readFile(path, "utf8")) as GatewayAlertIncident;
-    if (parsed.version !== 1 || typeof parsed.phase !== "string") {
+    if (parsed.version !== 1 || !Object.hasOwn(phases, parsed.phase)) {
       throw new Error(`Unsupported gateway alert state at ${path}`);
     }
     return parsed;
@@ -349,10 +286,6 @@ async function withFileLock<T>(path: string, run: () => Promise<T>): Promise<T> 
   }
 }
 
-function incidentName(incidentId: string): string {
-  return `gateway_alert_${incidentId.replaceAll("-", "").slice(0, 12)}`;
-}
-
 function workspaceLabel(kind: GatewayAlertKind): string {
   const problem = kind === "missing" ? "heartbeat missing" : "heartbeat stale";
   return `[jc] gateway ${problem} · GLM investigating`;
@@ -422,47 +355,22 @@ export class GatewayAlertInvestigator {
   async alert(kind: GatewayAlertKind, ageSeconds?: number): Promise<GatewayAlertResult> {
     return withFileLock(this.statePath, async () => {
       const existing = await readIncident(this.statePath);
-      const now = this.now();
-      let incident: GatewayAlertIncident;
+      const now = this.now().toISOString();
+      let incident = await this.send(existing, {
+        type: "ALERT",
+        kind,
+        ...(ageSeconds === undefined ? {} : { ageSeconds }),
+        now,
+        incidentId: crypto.randomUUID(),
+      });
 
-      if (!existing || existing.phase === "idle" || existing.phase === "recovered") {
-        const incidentId = crypto.randomUUID();
-        const initial: GatewayAlertIncident = {
-          version: 1,
-          phase: existing?.phase ?? "idle",
-          incidentId,
-          kind,
-          ...(ageSeconds === undefined ? {} : { ageSeconds }),
-          createdAt: now.toISOString(),
-          updatedAt: now.toISOString(),
-          attempt: 1,
-          attemptStartedAt: now.toISOString(),
-          agentName: incidentName(incidentId),
-        };
-        incident = transitionIncident(
-          initial,
-          { type: "ALERT" },
-          {
-            workspaceId: undefined,
-            paneId: undefined,
-            lastError: undefined,
-            retryAfter: undefined,
-            recoveredAt: undefined,
-          },
-        );
-        await writeIncident(this.statePath, incident);
-      } else if (existing.phase === "investigating") {
-        incident = transitionIncident(
-          existing,
-          { type: "ALERT" },
-          {
-            kind,
-            ...(ageSeconds === undefined ? {} : { ageSeconds }),
-            updatedAt: now.toISOString(),
-          },
-        );
+      if (incident.phase === "blocked") {
+        return { ok: false, action: "blocked", incident };
+      }
+
+      if (incident.phase === "investigating") {
         if (incident.workspaceId && (await this.workspaceExists(incident.workspaceId))) {
-          if (existing.kind !== kind) {
+          if (existing?.kind !== kind) {
             await this.runHerdr([
               "workspace",
               "rename",
@@ -471,66 +379,16 @@ export class GatewayAlertInvestigator {
             ]).catch(() => undefined);
           }
           if (incident.agentName && (await this.agentExists(incident.agentName))) {
-            await writeIncident(this.statePath, incident);
             return { ok: true, action: "existing", incident };
           }
-          incident = transitionIncident(
-            incident,
-            { type: "AGENT_LOST" },
-            {
-              agentName: incidentName(crypto.randomUUID()),
-              updatedAt: now.toISOString(),
-            },
-          );
-          await writeIncident(this.statePath, incident);
-          return this.advance(incident);
+          incident = await this.send(incident, {
+            type: "AGENT_LOST",
+            agentName: incidentName(crypto.randomUUID()),
+            now,
+          });
+        } else {
+          incident = await this.send(incident, { type: "WORKSPACE_LOST", now });
         }
-        incident = transitionIncident(
-          incident,
-          { type: "WORKSPACE_LOST" },
-          { updatedAt: now.toISOString() },
-        );
-        await writeIncident(this.statePath, incident);
-      } else if (existing.phase === "recovering" || existing.phase === "recoveryBlocked") {
-        incident = transitionIncident(
-          existing,
-          { type: "ALERT" },
-          {
-            kind,
-            ...(ageSeconds === undefined ? {} : { ageSeconds }),
-            attemptStartedAt: now.toISOString(),
-            updatedAt: now.toISOString(),
-            attempt: existing.attempt + 1,
-            lastError: undefined,
-          },
-        );
-        await writeIncident(this.statePath, incident);
-      } else if (existing.phase === "blocked") {
-        const retryAt = existing.retryAfter ? Date.parse(existing.retryAfter) : 0;
-        if (retryAt > now.getTime()) {
-          return { ok: false, action: "blocked", incident: existing };
-        }
-        incident = transitionIncident(
-          existing,
-          { type: "RETRY" },
-          {
-            kind,
-            ...(ageSeconds === undefined ? {} : { ageSeconds }),
-            updatedAt: now.toISOString(),
-            attemptStartedAt: now.toISOString(),
-            attempt: existing.attempt + 1,
-            retryAfter: undefined,
-            lastError: undefined,
-          },
-        );
-        await writeIncident(this.statePath, incident);
-      } else {
-        incident = {
-          ...existing,
-          kind,
-          ...(ageSeconds === undefined ? {} : { ageSeconds }),
-          updatedAt: now.toISOString(),
-        };
       }
 
       return this.advance(incident);
@@ -540,38 +398,24 @@ export class GatewayAlertInvestigator {
   async recover(): Promise<GatewayAlertResult> {
     return withFileLock(this.statePath, async () => {
       const existing = await readIncident(this.statePath);
-      if (!existing || existing.phase === "idle" || existing.phase === "recovered") {
+      const recoveryStartedAt = this.now().toISOString();
+      let recovering = await this.send(existing, {
+        type: "BEGIN_RECOVERY",
+        now: recoveryStartedAt,
+      });
+      if (recovering.phase !== "recovering") {
         return { ok: true, action: "idle", incident: existing };
       }
-
-      const recoveryStartedAt = this.now().toISOString();
-      let recovering =
-        existing.phase === "recovering"
-          ? existing
-          : transitionIncident(
-              existing,
-              { type: existing.phase === "recoveryBlocked" ? "RETRY_RECOVERY" : "BEGIN_RECOVERY" },
-              {
-                updatedAt: recoveryStartedAt,
-                retryAfter: undefined,
-                lastError: undefined,
-              },
-            );
-      await writeIncident(this.statePath, recovering);
 
       try {
         await this.ensureDefaultHerdr();
         const workspace = await this.ensureWorkspace(recovering);
-        recovering = {
-          ...recovering,
-          workspaceId: workspace.workspaceId,
-          paneId: workspace.paneId,
-          ...(workspace.created && recovering.workspaceId
-            ? { agentName: incidentName(crypto.randomUUID()) }
-            : {}),
-          updatedAt: this.now().toISOString(),
-        };
-        await writeIncident(this.statePath, recovering);
+        recovering = await this.send(recovering, {
+          type: "WORKSPACE_READY",
+          ...workspace,
+          replacementAgentName: incidentName(crypto.randomUUID()),
+          now: this.now().toISOString(),
+        });
         await this.probeModel(this.model);
         await this.ensureAgent(recovering);
 
@@ -597,29 +441,20 @@ export class GatewayAlertInvestigator {
           throw new Error(`Could not request gateway recovery receipt: ${prompted.stderr.trim()}`);
         }
 
-        const recovered = transitionIncident(
-          recovering,
-          { type: "RECOVERY_DELIVERED" },
-          {
-            updatedAt: this.now().toISOString(),
-            recoveredAt: recoveryStartedAt,
-            lastError: undefined,
-          },
-        );
-        await writeIncident(this.statePath, recovered);
+        const recovered = await this.send(recovering, {
+          type: "RECOVERY_DELIVERED",
+          recoveredAt: recoveryStartedAt,
+          now: this.now().toISOString(),
+        });
         await this.emitTelemetry("gateway_alert_investigator.recovered", recovered, true);
         return { ok: true, action: "recovered", incident: recovered };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        const blocked = transitionIncident(
-          recovering,
-          { type: "RECOVERY_FAILED" },
-          {
-            updatedAt: this.now().toISOString(),
-            lastError: message,
-          },
-        );
-        await writeIncident(this.statePath, blocked);
+        const blocked = await this.send(recovering, {
+          type: "RECOVERY_FAILED",
+          error: message,
+          now: this.now().toISOString(),
+        });
         await this.emitTelemetry(
           "gateway_alert_investigator.recovery_failed",
           blocked,
@@ -631,49 +466,46 @@ export class GatewayAlertInvestigator {
     });
   }
 
+  /** Runs one machine step and persists the result when the snapshot changed. */
+  private async send(
+    from: GatewayAlertIncident | undefined,
+    event: GatewayAlertEvent,
+  ): Promise<GatewayAlertIncident> {
+    const snapshot = snapshotOf(from);
+    const [next] = gatewayAlertInvestigator.transition(snapshot, event);
+    const incident = incidentOf(next);
+    if (next !== snapshot) await writeIncident(this.statePath, incident);
+    return incident;
+  }
+
   private async advance(start: GatewayAlertIncident): Promise<GatewayAlertResult> {
     let incident = start;
     try {
       if (incident.phase === "ensuringHerdr") {
         await this.ensureDefaultHerdr();
-        incident = transitionIncident(
-          incident,
-          { type: "HERDR_READY" },
-          {
-            updatedAt: this.now().toISOString(),
-          },
-        );
-        await writeIncident(this.statePath, incident);
+        incident = await this.send(incident, {
+          type: "HERDR_READY",
+          now: this.now().toISOString(),
+        });
       }
 
       if (incident.phase === "openingWorkspace") {
         const workspace = await this.ensureWorkspace(incident);
-        incident = transitionIncident(
-          incident,
-          { type: "WORKSPACE_READY" },
-          {
-            workspaceId: workspace.workspaceId,
-            paneId: workspace.paneId,
-            ...(workspace.created && incident.workspaceId
-              ? { agentName: incidentName(crypto.randomUUID()) }
-              : {}),
-            updatedAt: this.now().toISOString(),
-          },
-        );
-        await writeIncident(this.statePath, incident);
+        incident = await this.send(incident, {
+          type: "WORKSPACE_READY",
+          ...workspace,
+          replacementAgentName: incidentName(crypto.randomUUID()),
+          now: this.now().toISOString(),
+        });
       }
 
       if (incident.phase === "startingAgent") {
         await this.probeModel(this.model);
         await this.ensureAgent(incident);
-        incident = transitionIncident(
-          incident,
-          { type: "AGENT_READY" },
-          {
-            updatedAt: this.now().toISOString(),
-          },
-        );
-        await writeIncident(this.statePath, incident);
+        incident = await this.send(incident, {
+          type: "AGENT_READY",
+          now: this.now().toISOString(),
+        });
       }
 
       if (incident.phase === "promptingAgent") {
@@ -685,14 +517,10 @@ export class GatewayAlertInvestigator {
         if (prompted.exitCode !== 0) {
           throw new Error(`Herdr rejected investigator prompt: ${prompted.stderr.trim()}`);
         }
-        incident = transitionIncident(
-          incident,
-          { type: "PROMPT_ACCEPTED" },
-          {
-            updatedAt: this.now().toISOString(),
-          },
-        );
-        await writeIncident(this.statePath, incident);
+        incident = await this.send(incident, {
+          type: "PROMPT_ACCEPTED",
+          now: this.now().toISOString(),
+        });
         if (incident.workspaceId) {
           await this.runHerdr([
             "workspace",
@@ -712,16 +540,12 @@ export class GatewayAlertInvestigator {
       throw new Error(`Cannot advance gateway alert incident from ${incident.phase}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const failed = transitionIncident(
-        incident,
-        { type: "FAILED" },
-        {
-          updatedAt: this.now().toISOString(),
-          retryAfter: new Date(Date.parse(incident.attemptStartedAt) + this.retryMs).toISOString(),
-          lastError: message,
-        },
-      );
-      await writeIncident(this.statePath, failed);
+      const failed = await this.send(incident, {
+        type: "FAILED",
+        error: message,
+        retryMs: this.retryMs,
+        now: this.now().toISOString(),
+      });
       if (failed.workspaceId) {
         await this.runHerdr([
           "workspace",

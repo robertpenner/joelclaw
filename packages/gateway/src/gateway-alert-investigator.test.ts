@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { readFile, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   GatewayAlertInvestigator,
@@ -168,6 +168,10 @@ async function harness() {
     },
     failNextRecoveryPrompt() {
       failRecoveryPromptOnce = true;
+    },
+    async writeState(value: unknown): Promise<void> {
+      await mkdir(dirname(statePath), { recursive: true });
+      await writeFile(statePath, JSON.stringify(value));
     },
     async state(): Promise<GatewayAlertIncident> {
       return JSON.parse(await readFile(statePath, "utf8")) as GatewayAlertIncident;
@@ -365,6 +369,17 @@ describe("GatewayAlertInvestigator", () => {
     expect(blocked.incident?.lastError).toContain("Could not start default Herdr");
     expect(stillBlocked.action).toBe("blocked");
     expect(tested.commands).toHaveLength(commandCount);
+  });
+
+  test("refuses a stored incident whose phase the machine does not know", async () => {
+    const tested = await harness();
+    await tested.writeState({ version: 1, phase: "paused", incidentId: "x", attempt: 1 });
+
+    await expect(tested.investigator.alert("missing")).rejects.toThrow(
+      "Unsupported gateway alert state",
+    );
+    await expect(tested.investigator.recover()).rejects.toThrow("Unsupported gateway alert state");
+    expect(tested.commands).toHaveLength(0);
   });
 
   test("restarts a dead investigator in the existing incident workspace", async () => {
