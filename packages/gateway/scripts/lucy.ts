@@ -4,7 +4,7 @@
 // the joelclaw checkout.
 //
 //   bun run lucy:gen     format each .lucy file, then rewrite its
-//                        .machine.ts (XState v6), .native.ts (no XState)
+//                        .xstate.machine.ts (XState v6), .native.machine.ts (no XState)
 //                        and .laws.txt
 //   bun run lucy:check   fail if a .lucy file needs formatting, a generated
 //                        file is stale, or any law is not proven
@@ -40,8 +40,8 @@ for (const name of machines) {
   }
 
   const outputs = [
-    [`${name}.machine.ts`, run(compiler, [source])],
-    [`${name}.native.ts`, run(compiler, ["--target", "ts-native", source])],
+    [`${name}.xstate.machine.ts`, run(compiler, [source])],
+    [`${name}.native.machine.ts`, run(compiler, ["--target", "ts-native", source])],
     [`${name}.laws.txt`, run(compiler, ["--laws", source])],
   ] as const;
   if (outputs[0][1].exitCode !== 0 || outputs[1][1].exitCode !== 0) {

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { type GatewayAlertRecord, noIncident } from "./gateway-alert-investigator.context";
-import { gatewayAlertInvestigator as xstateMachine } from "./gateway-alert-investigator.machine";
-import { gatewayAlertInvestigator as nativeMachine } from "./gateway-alert-investigator.native";
+import { gatewayAlertInvestigator as xstateMachine } from "./gateway-alert-investigator.xstate.machine";
+import { gatewayAlertInvestigator as nativeMachine } from "./gateway-alert-investigator.native.machine";
 
 type Snapshot = ReturnType<typeof nativeMachine.getInitialSnapshot>;
 type Event = Parameters<typeof nativeMachine.transition>[1];

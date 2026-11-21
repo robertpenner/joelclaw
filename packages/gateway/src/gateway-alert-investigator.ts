@@ -7,7 +7,7 @@ import {
   type GatewayAlertRecord,
   incidentName,
 } from "./gateway-alert-investigator.context";
-import { gatewayAlertInvestigator } from "./gateway-alert-investigator.native";
+import { gatewayAlertInvestigator } from "./gateway-alert-investigator.native.machine";
 
 export type { GatewayAlertKind } from "./gateway-alert-investigator.context";
 

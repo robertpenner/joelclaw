@@ -7,10 +7,10 @@ and what Lucy's language and tooling should improve.
 Lucy lives in a private repository. Each machine is generated twice from its
 `.lucy` source, and both outputs are checked in:
 
-- `.machine.ts` is an XState v6 FSM built with `createFSM` from
+- `.xstate.machine.ts` is an XState v6 FSM built with `createFSM` from
   `xstate-v6/fsm`. The gateway installs XState 6 under that npm alias
   (`xstate-v6: npm:xstate@6.0.0-beta.3`) beside its XState 5 dependency.
-- `.native.ts` is a dependency-free module with the same
+- `.native.machine.ts` is a dependency-free module with the same
   `getInitialSnapshot()` and `transition(snapshot, event)` interface. The host
   runs this one.
 
@@ -21,7 +21,7 @@ a penner checkout:
 
 ```sh
 cd packages/gateway
-LUCY_HOME=/path/to/penner bun run lucy:gen    # format .lucy, rewrite .machine.ts, .native.ts and .laws.txt
+LUCY_HOME=/path/to/penner bun run lucy:gen    # format .lucy, rewrite both .machine.ts files and .laws.txt
 LUCY_HOME=/path/to/penner bun run lucy:check  # fail if unformatted, stale, or a law is unproven
 ```
 
@@ -33,14 +33,14 @@ hosted CI job runs `lucy:check`.
 The machine moved from an inline `createMachine` in
 `gateway-alert-investigator.ts` to these files in `src/`:
 
-| File                                    | Role                                                       |
-| --------------------------------------- | ---------------------------------------------------------- |
-| `gateway-alert-investigator.lucy`       | States, events, assignments and laws                       |
-| `gateway-alert-investigator.context.ts` | Incident record, event payloads, the guard and the patches |
-| `gateway-alert-investigator.machine.ts` | Generated XState v6 FSM; do not edit                       |
-| `gateway-alert-investigator.native.ts`  | Generated with `--target ts-native`; do not edit           |
-| `gateway-alert-investigator.laws.txt`   | Generated law report                                       |
-| `gateway-alert-investigator.ts`         | Host: Herdr commands, file lock, persistence, telemetry    |
+| File                                           | Role                                                       |
+| ---------------------------------------------- | ---------------------------------------------------------- |
+| `gateway-alert-investigator.lucy`              | States, events, assignments and laws                       |
+| `gateway-alert-investigator.context.ts`        | Incident record, event payloads, the guard and the patches |
+| `gateway-alert-investigator.xstate.machine.ts` | Generated XState v6 FSM; do not edit                       |
+| `gateway-alert-investigator.native.machine.ts` | Generated with `--target ts-native`; do not edit           |
+| `gateway-alert-investigator.laws.txt`          | Generated law report                                       |
+| `gateway-alert-investigator.ts`                | Host: Herdr commands, file lock, persistence, telemetry    |
 
 The XState machine held only the phase. The host patched every other field of
 the incident at each call site, and chose the patch by checking the phase
