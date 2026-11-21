@@ -11,7 +11,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
-const machines = ["gateway-alert-investigator"];
+const machines = ["gateway-alert-investigator", "slack-thread-session", "slack-thread-turn"];
 
 const srcDir = resolve(import.meta.dir, "../src");
 const lucyHome = process.env.LUCY_HOME ?? resolve(import.meta.dir, "../../../../penner");

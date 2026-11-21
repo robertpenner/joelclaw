@@ -1,0 +1,52 @@
+slack-thread-turn.lucy: 4 configurations, 4 reachable from the initial one
+All 4 states can be entered from startup.
+law every_state_is_reachable: proven
+  every state: state idle proven, state claimed proven, state launched proven, state completed proven
+  depends on guard outcomes: :sameTurn passes
+  state idle: proven
+    initial configuration idle
+  state claimed: proven
+    witness from search, starting at idle:
+      ^CLAIM -> claimed
+  state launched: proven
+    witness from search, starting at idle:
+      ^CLAIM -> claimed
+      ^LAUNCHED -> launched  (assumes :sameTurn passes)
+  state completed: proven
+    witness from search, starting at idle:
+      ^CLAIM -> claimed
+      ^LAUNCHED -> launched  (assumes :sameTurn passes)
+      ^COMPLETED -> completed  (assumes :sameTurn passes)
+law every_turn_can_complete: proven
+  every state: state idle proven, state claimed proven, state launched proven, state completed proven
+  depends on guard outcomes: :sameTurn passes
+  state idle: proven
+    witness from search, starting at idle:
+      ^CLAIM -> claimed
+      ^LAUNCHED -> launched  (assumes :sameTurn passes)
+      ^COMPLETED -> completed  (assumes :sameTurn passes)
+  state claimed: proven
+    witness from search, starting at claimed:
+      ^LAUNCHED -> launched  (assumes :sameTurn passes)
+      ^COMPLETED -> completed  (assumes :sameTurn passes)
+  state launched: proven
+    witness from search, starting at launched:
+      ^COMPLETED -> completed  (assumes :sameTurn passes)
+  state completed: proven
+    witness from search, starting at completed:
+law launch_follows_claim: proven
+  product: 12 vertices
+  the closure checker accepted the search set on the product
+  closed set from search: idle:0 claimed:2 launched:2
+law completion_follows_launch: proven
+  product: 12 vertices
+  the closure checker accepted the search set on the product
+  closed set from search: idle:0 claimed:1 launched:2 completed:2
+law one_turn_in_flight: proven
+  product: 12 vertices
+  the closure checker accepted the search set on the product
+  closed set from search: claimed:0 claimed:2 launched:1 completed:2
+law completed_turn_accepts_next: proven
+  the one-transition scan found this edge
+  depends on guard outcomes: :sameTurn fails
+  edge completed ^CLAIM -> claimed

@@ -1,0 +1,74 @@
+slack-thread-session.lucy: 6 configurations, 6 reachable from the initial one
+All 6 states can be entered from startup.
+law every_state_is_reachable: proven
+  every state: state untracked proven, state neutral proven, state bound proven, state running proven, state resolving proven, state retired proven
+  depends on guard outcomes: :arrivesBound passes and fails, :quietOver passes
+  state untracked: proven
+    initial configuration untracked
+  state neutral: proven
+    witness from search, starting at untracked:
+      ^ACTIVATE -> neutral  (assumes :arrivesBound fails)
+  state bound: proven
+    witness from search, starting at untracked:
+      ^ACTIVATE -> bound  (assumes :arrivesBound passes)
+  state running: proven
+    witness from search, starting at untracked:
+      ^ACTIVATE -> neutral  (assumes :arrivesBound fails)
+      ^START -> running
+  state resolving: proven
+    witness from search, starting at untracked:
+      ^ACTIVATE -> neutral  (assumes :arrivesBound fails)
+      ^RESOLVE -> resolving
+  state retired: proven
+    witness from search, starting at untracked:
+      ^ACTIVATE -> neutral  (assumes :arrivesBound fails)
+      ^RESOLVE -> resolving
+      ^RETIRE -> retired  (assumes :quietOver passes)
+law every_thread_can_run_again: proven
+  every state: state untracked proven, state neutral proven, state bound proven, state running proven, state resolving proven, state retired proven
+  depends on guard outcomes: :arrivesBound fails, :hasBinding fails
+  state untracked: proven
+    witness from search, starting at untracked:
+      ^ACTIVATE -> neutral  (assumes :arrivesBound fails)
+      ^START -> running
+  state neutral: proven
+    witness from search, starting at neutral:
+      ^START -> running
+  state bound: proven
+    witness from search, starting at bound:
+      ^START -> running
+  state running: proven
+    witness from search, starting at running:
+  state resolving: proven
+    witness from search, starting at resolving:
+      ^HUMAN_REPLY -> neutral  (assumes :hasBinding fails)
+      ^START -> running
+  state retired: proven
+    witness from search, starting at retired:
+      ^ACTIVATE -> neutral  (assumes :arrivesBound fails)
+      ^START -> running
+law retirement_needs_resolve: proven
+  product: 18 vertices
+  the closure checker accepted the search set on the product
+  closed set from search: untracked:0 neutral:1 neutral:2 bound:1 bound:2 running:1 running:2 resolving:2 retired:2
+law only_resolving_retires: proven
+  every edge on the event was checked
+  2 edges on the event checked
+law quiet_time_over_retires: proven
+  the one-transition scan found this edge
+  depends on guard outcomes: :quietOver passes
+  edge resolving ^RETIRE -> retired
+law early_retire_waits: proven
+  this edge starts and ends in the same configuration
+  depends on guard outcomes: :quietOver fails
+  edge resolving ^RETIRE -> resolving
+law reply_reopens: proven
+  the one-transition scan found no matching edge
+  30 edges on the event checked
+law settle_ends_turn: proven
+  the one-transition scan found no matching edge
+  30 edges on the event checked
+law untracked_only_at_start: proven
+  product: 12 vertices
+  the closure checker accepted the search set on the product
+  closed set from search: neutral:0 neutral:1 bound:0 bound:1 running:0 running:1 resolving:0 resolving:1 retired:0 retired:1

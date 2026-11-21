@@ -1,0 +1,145 @@
+use './slack-thread-session.context.ts' {
+  type SlackThreadRecord, type Stamped, type Activation, type PlanAttached,
+  type RuntimeAttached, type QuietRequested,
+  noSession, arrivesBound, hasBinding, quietOver,
+  openSession, refreshActivation, reopen, attachPlan, attachRuntime, beginQuiet
+}
+
+// One Slack thread that a Pi session answers. A thread is bound when it has a
+// verified project directory and neutral when it does not. The turn being
+// answered is tracked separately by slackThreadTurn. Every event carries the
+// host's clock reading as `now`.
+machine slackThreadSession {
+  context: SlackThreadRecord = :noSession
+
+  event ACTIVATE: Activation
+  event HUMAN_REPLY: Stamped
+  event PLAN: PlanAttached
+  event START: RuntimeAttached
+  event SETTLE: Stamped
+  event RESOLVE: QuietRequested
+  event RETIRE: Stamped
+
+  // The thread has no stored session.
+  initial state untracked {
+    ACTIVATE {
+      if :arrivesBound -> bound { assign :openSession }
+      else -> neutral { assign :openSession }
+    }
+  }
+
+  // Idle without a project. A verified binding moves it to bound.
+  state neutral {
+    ACTIVATE {
+      if :arrivesBound -> bound { assign :refreshActivation }
+      else -> neutral { assign :refreshActivation }
+    }
+
+    HUMAN_REPLY -> neutral { assign :reopen }
+
+    PLAN -> neutral { assign :attachPlan }
+
+    START -> running { assign :attachRuntime }
+
+    RESOLVE -> resolving { assign :beginQuiet }
+  }
+
+  // Idle with a verified project.
+  state bound {
+    ACTIVATE -> bound { assign :refreshActivation }
+
+    HUMAN_REPLY -> bound { assign :reopen }
+
+    PLAN -> bound { assign :attachPlan }
+
+    START -> running { assign :attachRuntime }
+
+    RESOLVE -> resolving { assign :beginQuiet }
+  }
+
+  // A Pi turn is running. A binding that arrives now takes effect when the
+  // turn settles.
+  state running {
+    ACTIVATE -> running { assign :refreshActivation }
+
+    HUMAN_REPLY -> running { assign :reopen }
+
+    PLAN -> running { assign :attachPlan }
+
+    START -> running { assign :attachRuntime }
+
+    SETTLE {
+      if :hasBinding -> bound { assign event.now to updatedAt }
+      else -> neutral { assign event.now to updatedAt }
+    }
+
+    RESOLVE -> resolving { assign :beginQuiet }
+  }
+
+  // The thread is waiting out its quiet time. A human reply reopens it; a
+  // second RESOLVE restarts the quiet time.
+  state resolving {
+    ACTIVATE -> resolving { assign :refreshActivation }
+
+    HUMAN_REPLY {
+      if :hasBinding -> bound { assign :reopen }
+      else -> neutral { assign :reopen }
+    }
+
+    PLAN -> resolving { assign :attachPlan }
+
+    START -> resolving { assign :attachRuntime }
+
+    RESOLVE -> resolving { assign :beginQuiet }
+
+    RETIRE {
+      if :quietOver -> retired { assign event.now to updatedAt }
+      else -> resolving
+    }
+  }
+
+  // The host has closed the thread's workspace. A new activation starts a new
+  // session.
+  state retired {
+    ACTIVATE {
+      if :arrivesBound -> bound { assign :openSession }
+      else -> neutral { assign :openSession }
+    }
+  }
+
+  law every_state_is_reachable {
+    can reach every state
+  }
+
+  law every_thread_can_run_again {
+    every state can reach running
+  }
+
+  law retirement_needs_resolve {
+    ^RESOLVE precedes retired
+  }
+
+  law only_resolving_retires {
+    ^RETIRE only from resolving
+  }
+
+  law quiet_time_over_retires {
+    some path(resolving -> ^RETIRE[:quietOver] -> retired)
+  }
+
+  law early_retire_waits {
+    ^RETIRE loops on resolving
+  }
+
+  law reply_reopens {
+    no path(resolving -> ^HUMAN_REPLY -> resolving)
+  }
+
+  law settle_ends_turn {
+    no path(running -> ^SETTLE -> running)
+  }
+
+  law untracked_only_at_start {
+    no path(to untracked)
+  }
+}
