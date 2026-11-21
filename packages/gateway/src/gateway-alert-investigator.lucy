@@ -146,6 +146,10 @@ machine gatewayAlertInvestigator {
     no path(blocked -> ^ALERT[:retryDue] -> blocked)
   }
 
+  law due_retry_restarts_herdr {
+    some path(blocked -> ^ALERT[:retryDue] -> ensuringHerdr)
+  }
+
   law blocked_alert_can_wait {
     ^ALERT loops on blocked
   }

@@ -96,6 +96,10 @@ law recovery_needs_receipt: proven
 law blocked_retries_when_due: proven
   the one-transition scan found no matching edge
   31 edges on the event checked
+law due_retry_restarts_herdr: proven
+  the one-transition scan found this edge
+  depends on guard outcomes: :retryDue passes
+  edge blocked ^ALERT -> ensuringHerdr
 law blocked_alert_can_wait: proven
   this edge starts and ends in the same configuration
   depends on guard outcomes: :retryDue fails
