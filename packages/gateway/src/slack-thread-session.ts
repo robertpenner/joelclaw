@@ -1,7 +1,9 @@
 import { mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, resolve } from "node:path";
-import { createActor, createMachine } from "xstate";
+import type { SlackThreadRecord } from "./slack-thread-session.context";
+import { slackThreadSession } from "./slack-thread-session.native.machine";
+import { slackThreadTurn } from "./slack-thread-turn.native.machine";
 import type { SlackChannelContextBinding } from "./slack-work-request";
 
 export const DEFAULT_SLACK_THREAD_SESSIONS_PATH = resolve(
@@ -10,34 +12,22 @@ export const DEFAULT_SLACK_THREAD_SESSIONS_PATH = resolve(
 );
 export const DEFAULT_SLACK_THREAD_QUIET_TIMEOUT_MS = 30 * 60_000;
 
-export type SlackThreadSessionStatus =
-  | "neutral"
-  | "bound"
-  | "running"
-  | "resolving"
-  | "retired";
+type SessionSnapshot = ReturnType<typeof slackThreadSession.getInitialSnapshot>;
+type SessionEvent = Parameters<typeof slackThreadSession.transition>[1];
+type TurnSnapshot = ReturnType<typeof slackThreadTurn.getInitialSnapshot>;
+type TurnEvent = Parameters<typeof slackThreadTurn.transition>[1];
 
-export type SlackThreadSession = {
-  readonly threadId: string;
-  readonly channelId: string;
-  readonly channelName: string;
-  readonly threadTs: string;
+/** A stored session is never `untracked`; that state means no record exists. */
+export type SlackThreadSessionStatus = Exclude<SessionSnapshot["value"], "untracked">;
+/** A stored turn is never `idle`; that state means `currentTurn` is absent. */
+export type SlackThreadTurnState = Exclude<TurnSnapshot["value"], "idle">;
+
+/** The stored form of a thread's session and turn snapshots. */
+export type SlackThreadSession = SlackThreadRecord & {
   readonly status: SlackThreadSessionStatus;
-  readonly binding?: SlackChannelContextBinding;
-  readonly sessionId?: string;
-  readonly sessionFile?: string;
-  readonly paneId?: string;
-  readonly workspaceId?: string;
-  readonly plannedSessionId?: string;
-  readonly plannedWorkspaceLabel?: string;
-  readonly createdAt: string;
-  readonly updatedAt: string;
-  readonly lastHumanMessageAt: string;
-  readonly resolvedAt?: string;
-  readonly retireAfter?: string;
   readonly currentTurn?: {
     readonly sourceEventId: string;
-    readonly state: "claimed" | "launched" | "completed" | "delivered";
+    readonly state: SlackThreadTurnState;
     readonly updatedAt: string;
   };
 };
@@ -47,64 +37,70 @@ type SlackThreadSessionFile = {
   readonly sessions: Readonly<Record<string, SlackThreadSession>>;
 };
 
-export const slackThreadSessionMachine = createMachine({
-  id: "slackThreadSession",
-  initial: "neutral",
-  states: {
-    neutral: {
-      on: {
-        BIND: "bound",
-        START: "running",
-        RESOLVE: "resolving",
-      },
-    },
-    bound: {
-      on: {
-        START: "running",
-        RESOLVE: "resolving",
-      },
-    },
-    running: {
-      on: {
-        SETTLE_BOUND: "bound",
-        SETTLE_NEUTRAL: "neutral",
-        RESOLVE: "resolving",
-      },
-    },
-    resolving: {
-      on: {
-        HUMAN_REPLY_BOUND: "bound",
-        HUMAN_REPLY_NEUTRAL: "neutral",
-        RETIRE: "retired",
-      },
-    },
-    retired: { type: "final" },
-  },
-});
+/** A thread's two machine snapshots. A thread with no record is untracked and idle. */
+type Thread = { readonly session: SessionSnapshot; readonly turn: TurnSnapshot };
+
+// `ts-native` exports no list of state names, and its `transition` returns
+// undefined for an unknown one, so stored states are checked against these.
+const statuses: Record<SlackThreadSessionStatus, true> = {
+  neutral: true,
+  bound: true,
+  running: true,
+  resolving: true,
+  retired: true,
+};
+const turnStates: Record<SlackThreadTurnState, true> = {
+  claimed: true,
+  launched: true,
+  completed: true,
+};
+
+function threadOf(stored: SlackThreadSession | undefined): Thread {
+  if (!stored) {
+    return {
+      session: slackThreadSession.getInitialSnapshot(),
+      turn: slackThreadTurn.getInitialSnapshot(),
+    };
+  }
+  const { status, currentTurn, ...record } = stored;
+  return {
+    session: { status: "active", value: status, context: record, output: undefined, error: undefined },
+    turn: currentTurn
+      ? {
+          status: "active",
+          value: currentTurn.state,
+          context: { sourceEventId: currentTurn.sourceEventId, updatedAt: currentTurn.updatedAt },
+          output: undefined,
+          error: undefined,
+        }
+      : slackThreadTurn.getInitialSnapshot(),
+  };
+}
+
+/** Returns the stored form of a thread, or undefined while it is untracked. */
+function storedOf({ session, turn }: Thread): SlackThreadSession | undefined {
+  const status = session.value;
+  if (status === "untracked") return undefined;
+  const state = turn.value;
+  return {
+    ...session.context,
+    status,
+    ...(state === "idle" ? {} : { currentTurn: { ...turn.context, state } }),
+  };
+}
+
+function sendSession(snapshot: SessionSnapshot, event: SessionEvent): SessionSnapshot {
+  return slackThreadSession.transition(snapshot, event)[0];
+}
+
+function sendTurn(snapshot: TurnSnapshot, event: TurnEvent): TurnSnapshot {
+  return slackThreadTurn.transition(snapshot, event)[0];
+}
 
 function threadId(channelId: string, threadTs: string): string {
   return `slack:${channelId}:${threadTs}`;
 }
 
-function machineState(status: SlackThreadSessionStatus): string {
-  return status;
-}
-
-function transitionStatus(
-  status: SlackThreadSessionStatus,
-  event: "BIND" | "START" | "SETTLE_BOUND" | "SETTLE_NEUTRAL" | "RESOLVE" | "HUMAN_REPLY_BOUND" | "HUMAN_REPLY_NEUTRAL" | "RETIRE",
-): SlackThreadSessionStatus {
-  const actor = createActor(slackThreadSessionMachine, {
-    snapshot: slackThreadSessionMachine.resolveState({
-      value: machineState(status),
-      context: {},
-    }),
-  }).start();
-  actor.send({ type: event });
-  const next = String(actor.getSnapshot().value) as SlackThreadSessionStatus;
-  actor.stop();
-  return next;
-}
 
 function bindingRoot(binding: SlackChannelContextBinding | undefined): string | undefined {
   return binding?.cwd?.trim() || binding?.repo?.trim();
@@ -129,12 +125,18 @@ async function verifiedBinding(
 async function readFileState(path: string): Promise<SlackThreadSessionFile> {
   try {
     const value = JSON.parse(await readFile(path, "utf8")) as SlackThreadSessionFile;
-    return {
-      version: 1,
-      sessions: value?.sessions && typeof value.sessions === "object"
-        ? value.sessions
-        : {},
-    };
+    const sessions = value?.sessions && typeof value.sessions === "object"
+      ? value.sessions
+      : {};
+    for (const session of Object.values(sessions)) {
+      if (
+        !Object.hasOwn(statuses, session.status)
+        || (session.currentTurn && !Object.hasOwn(turnStates, session.currentTurn.state))
+      ) {
+        throw new Error(`Unsupported Slack thread session state for ${session.threadId} at ${path}`);
+      }
+    }
+    return { version: 1, sessions };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return { version: 1, sessions: {} };
@@ -220,114 +222,81 @@ export class SlackThreadSessionRegistry {
     return sessions.filter((session) => session.status !== "retired");
   }
 
+  /** Opens a session, or refreshes one. A retired thread starts over with no turn. */
   async activate(input: {
     readonly channelId: string;
     readonly channelName: string;
     readonly threadTs: string;
     readonly binding?: SlackChannelContextBinding;
   }): Promise<SlackThreadSession> {
-    const now = this.now().toISOString();
-    const verified = await verifiedBinding(input.binding);
-    const current = await this.get(input.channelId, input.threadTs);
-    if (current && current.status !== "retired") {
-      return this.update(current.threadId, {
-        channelName: input.channelName,
-        lastHumanMessageAt: now,
-        updatedAt: now,
-        ...(verified && !current.binding ? {
-          binding: verified,
-          status: transitionStatus(current.status, "BIND"),
-        } : {}),
-      });
-    }
+    const binding = await verifiedBinding(input.binding);
     const id = threadId(input.channelId, input.threadTs);
-    const session: SlackThreadSession = {
-      threadId: id,
-      channelId: input.channelId,
-      channelName: input.channelName,
-      threadTs: input.threadTs,
-      status: verified ? "bound" : "neutral",
-      ...(verified ? { binding: verified } : {}),
-      createdAt: now,
-      updatedAt: now,
-      lastHumanMessageAt: now,
-    };
-    return this.update(id, session);
+    return this.change(id, (thread) => {
+      const session = sendSession(thread.session, {
+        type: "ACTIVATE",
+        threadId: id,
+        channelId: input.channelId,
+        channelName: input.channelName,
+        threadTs: input.threadTs,
+        binding,
+        now: this.stamp(),
+      });
+      const turn = thread.session.value === "retired"
+        ? slackThreadTurn.getInitialSnapshot()
+        : thread.turn;
+      return { session, turn };
+    }, (stored) => stored!);
   }
 
+  /** Returns undefined for a thread with no live session. */
   async noteHumanReply(
     channelId: string,
     threadTs: string,
   ): Promise<SlackThreadSession | undefined> {
-    const current = await this.get(channelId, threadTs);
-    if (!current || current.status === "retired") return undefined;
-    const now = this.now().toISOString();
-    const status = current.status === "resolving"
-      ? transitionStatus(
-          current.status,
-          current.binding ? "HUMAN_REPLY_BOUND" : "HUMAN_REPLY_NEUTRAL",
-        )
-      : current.status;
-    return this.update(current.threadId, {
-      status,
-      updatedAt: now,
-      lastHumanMessageAt: now,
-      resolvedAt: undefined,
-      retireAfter: undefined,
-    });
+    return this.change(
+      threadId(channelId, threadTs),
+      (thread) => ({
+        ...thread,
+        session: sendSession(thread.session, { type: "HUMAN_REPLY", now: this.stamp() }),
+      }),
+      (stored) => (stored?.status === "retired" ? undefined : stored),
+    );
   }
 
+  /**
+   * Claims a turn for `sourceEventId`. Claiming the current turn again returns
+   * `claimed: false`; claiming another while one is in flight throws.
+   */
   async claimTurn(input: {
     readonly channelId: string;
     readonly threadTs: string;
     readonly sourceEventId: string;
   }): Promise<{ readonly claimed: boolean; readonly session: SlackThreadSession }> {
-    const current = await this.get(input.channelId, input.threadTs);
-    if (!current) throw new Error(`No Slack thread session for ${input.channelId}:${input.threadTs}`);
-    return withFileLock(this.path, async () => {
-      const state = await readFileState(this.path);
-      const fresh = state.sessions[current.threadId];
-      if (!fresh) throw new Error(`No Slack thread session for ${input.channelId}:${input.threadTs}`);
-      if (fresh.currentTurn?.sourceEventId === input.sourceEventId) {
-        return { claimed: false, session: fresh };
-      }
-      if (
-        fresh.currentTurn?.state === "claimed"
-        || fresh.currentTurn?.state === "launched"
-      ) {
+    let claimed = false;
+    const session = await this.changeSession(input.channelId, input.threadTs, (thread) => {
+      const turn = sendTurn(thread.turn, {
+        type: "CLAIM",
+        sourceEventId: input.sourceEventId,
+        now: this.stamp(),
+      });
+      claimed = turn !== thread.turn;
+      if (!claimed && thread.turn.context.sourceEventId !== input.sourceEventId) {
         throw new Error(
-          `Slack thread session ${fresh.threadId} already has turn ${fresh.currentTurn.sourceEventId} in flight`,
+          `Slack thread session ${threadId(input.channelId, input.threadTs)} already has turn ${thread.turn.context.sourceEventId} in flight`,
         );
       }
-      const now = this.now().toISOString();
-      const session = {
-        ...fresh,
-        currentTurn: {
-          sourceEventId: input.sourceEventId,
-          state: "claimed" as const,
-          updatedAt: now,
-        },
-        updatedAt: now,
-      };
-      await writeFileState(this.path, { ...state.sessions, [fresh.threadId]: session });
-      return { claimed: true, session };
+      return { ...thread, turn };
     });
+    return { claimed, session };
   }
 
+  /** Repeating the step the turn already took is allowed, so a retried caller succeeds. */
   async markTurnLaunched(
     channelId: string,
     threadTs: string,
     sourceEventId: string,
   ): Promise<SlackThreadSession> {
-    const current = await this.get(channelId, threadTs);
-    if (!current || current.currentTurn?.sourceEventId !== sourceEventId) {
-      throw new Error(`No claimed Slack thread turn ${sourceEventId}`);
-    }
-    const now = this.now().toISOString();
-    return this.update(current.threadId, {
-      currentTurn: { sourceEventId, state: "launched", updatedAt: now },
-      updatedAt: now,
-    });
+    return this.advanceTurn(channelId, threadTs, { type: "LAUNCHED", sourceEventId, now: this.stamp() }, "launched");
   }
 
   async completeTurn(
@@ -335,15 +304,7 @@ export class SlackThreadSessionRegistry {
     threadTs: string,
     sourceEventId: string,
   ): Promise<SlackThreadSession> {
-    const current = await this.get(channelId, threadTs);
-    if (!current || current.currentTurn?.sourceEventId !== sourceEventId) {
-      throw new Error(`No claimed Slack thread turn ${sourceEventId}`);
-    }
-    const now = this.now().toISOString();
-    return this.update(current.threadId, {
-      currentTurn: { sourceEventId, state: "completed", updatedAt: now },
-      updatedAt: now,
-    });
+    return this.advanceTurn(channelId, threadTs, { type: "COMPLETED", sourceEventId, now: this.stamp() }, "completed");
   }
 
   async attachPlan(input: {
@@ -352,12 +313,11 @@ export class SlackThreadSessionRegistry {
     readonly plannedSessionId: string;
     readonly plannedWorkspaceLabel: string;
   }): Promise<SlackThreadSession> {
-    const current = await this.get(input.channelId, input.threadTs);
-    if (!current) throw new Error(`No Slack thread session for ${input.channelId}:${input.threadTs}`);
-    return this.update(current.threadId, {
+    return this.sendToSession(input.channelId, input.threadTs, {
+      type: "PLAN",
       plannedSessionId: input.plannedSessionId,
       plannedWorkspaceLabel: input.plannedWorkspaceLabel,
-      updatedAt: this.now().toISOString(),
+      now: this.stamp(),
     });
   }
 
@@ -369,28 +329,18 @@ export class SlackThreadSessionRegistry {
     readonly paneId?: string;
     readonly workspaceId?: string;
   }): Promise<SlackThreadSession> {
-    const current = await this.get(input.channelId, input.threadTs);
-    if (!current) throw new Error(`No Slack thread session for ${input.channelId}:${input.threadTs}`);
-    return this.update(current.threadId, {
-      status: transitionStatus(current.status, "START"),
+    return this.sendToSession(input.channelId, input.threadTs, {
+      type: "START",
       sessionId: input.sessionId,
       sessionFile: input.sessionFile,
       paneId: input.paneId,
       workspaceId: input.workspaceId,
-      updatedAt: this.now().toISOString(),
+      now: this.stamp(),
     });
   }
 
   async settle(channelId: string, threadTs: string): Promise<SlackThreadSession> {
-    const current = await this.get(channelId, threadTs);
-    if (!current) throw new Error(`No Slack thread session for ${channelId}:${threadTs}`);
-    return this.update(current.threadId, {
-      status: transitionStatus(
-        current.status,
-        current.binding ? "SETTLE_BOUND" : "SETTLE_NEUTRAL",
-      ),
-      updatedAt: this.now().toISOString(),
-    });
+    return this.sendToSession(channelId, threadTs, { type: "SETTLE", now: this.stamp() });
   }
 
   async resolve(
@@ -398,53 +348,108 @@ export class SlackThreadSessionRegistry {
     threadTs: string,
     quietTimeoutMs = DEFAULT_SLACK_THREAD_QUIET_TIMEOUT_MS,
   ): Promise<SlackThreadSession> {
-    const current = await this.get(channelId, threadTs);
-    if (!current) throw new Error(`No Slack thread session for ${channelId}:${threadTs}`);
-    const now = this.now();
-    return this.update(current.threadId, {
-      status: transitionStatus(current.status, "RESOLVE"),
-      resolvedAt: now.toISOString(),
-      retireAfter: new Date(now.getTime() + quietTimeoutMs).toISOString(),
-      updatedAt: now.toISOString(),
+    return this.sendToSession(channelId, threadTs, {
+      type: "RESOLVE",
+      quietTimeoutMs,
+      now: this.stamp(),
     });
   }
 
+  /** Sends `RETIRE` to every session and returns those that retired. */
   async retireDue(): Promise<SlackThreadSession[]> {
     return withFileLock(this.path, async () => {
       const state = await readFileState(this.path);
-      const nowMs = this.now().getTime();
-      const retired: SlackThreadSession[] = [];
+      const now = this.stamp();
       const sessions = { ...state.sessions };
-      for (const [id, session] of Object.entries(sessions)) {
-        if (
-          session.status !== "resolving"
-          || !session.retireAfter
-          || Date.parse(session.retireAfter) > nowMs
-        ) continue;
-        const next = {
-          ...session,
-          status: transitionStatus(session.status, "RETIRE"),
-          updatedAt: this.now().toISOString(),
-        } as SlackThreadSession;
+      const changed: SlackThreadSession[] = [];
+      for (const [id, stored] of Object.entries(state.sessions)) {
+        const thread = threadOf(stored);
+        const session = sendSession(thread.session, { type: "RETIRE", now });
+        const next = storedOf({ ...thread, session });
+        if (session === thread.session || !next) continue;
         sessions[id] = next;
-        retired.push(next);
+        changed.push(next);
       }
-      if (retired.length > 0) await writeFileState(this.path, sessions);
+      if (changed.length > 0) await writeFileState(this.path, sessions);
+      const retired = changed.filter((session) => session.status === "retired");
       return retired;
     });
   }
 
-  private async update(
+  private stamp(): string {
+    return this.now().toISOString();
+  }
+
+  /**
+   * Reads one thread inside the file lock, applies `step`, and writes the
+   * thread back only when a machine accepted an event.
+   */
+  private async change<T>(
     id: string,
-    patch: Partial<SlackThreadSession>,
-  ): Promise<SlackThreadSession> {
+    step: (thread: Thread) => Thread,
+    result: (stored: SlackThreadSession | undefined) => T,
+  ): Promise<T> {
     return withFileLock(this.path, async () => {
       const state = await readFileState(this.path);
-      const current = state.sessions[id];
-      const next = { ...current, ...patch } as SlackThreadSession;
-      await writeFileState(this.path, { ...state.sessions, [id]: next });
-      return next;
+      const thread = threadOf(state.sessions[id]);
+      const next = step(thread);
+      const stored = storedOf(next);
+      if (stored && (next.session !== thread.session || next.turn !== thread.turn)) {
+        await writeFileState(this.path, { ...state.sessions, [id]: stored });
+      }
+      return result(stored);
     });
   }
 
+  /** Like `change`, for a thread that must already have a session. */
+  private async changeSession(
+    channelId: string,
+    threadTs: string,
+    step: (thread: Thread) => Thread,
+  ): Promise<SlackThreadSession> {
+    return this.change(
+      threadId(channelId, threadTs),
+      (thread) => {
+        if (thread.session.value === "untracked") {
+          throw new Error(`No Slack thread session for ${channelId}:${threadTs}`);
+        }
+        return step(thread);
+      },
+      (stored) => stored!,
+    );
+  }
+
+  /** A session ignores an event its state does not accept, and nothing is written. */
+  private async sendToSession(
+    channelId: string,
+    threadTs: string,
+    event: SessionEvent,
+  ): Promise<SlackThreadSession> {
+    return this.changeSession(channelId, threadTs, (thread) => ({
+      ...thread,
+      session: sendSession(thread.session, event),
+    }));
+  }
+
+  private async advanceTurn(
+    channelId: string,
+    threadTs: string,
+    event: TurnEvent,
+    reached: SlackThreadTurnState,
+  ): Promise<SlackThreadSession> {
+    return this.changeSession(channelId, threadTs, (thread) => {
+      const turn = sendTurn(thread.turn, event);
+      const repeated = thread.turn.value === reached
+        && thread.turn.context.sourceEventId === event.sourceEventId;
+      if (turn === thread.turn && !repeated) {
+        const current = thread.turn.value === "idle"
+          ? "no turn"
+          : `turn ${thread.turn.context.sourceEventId} ${thread.turn.value}`;
+        throw new Error(
+          `Slack thread turn ${event.sourceEventId} cannot become ${reached}: the thread has ${current}`,
+        );
+      }
+      return { ...thread, turn };
+    });
+  }
 }
