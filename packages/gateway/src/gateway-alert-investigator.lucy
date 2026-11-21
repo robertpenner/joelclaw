@@ -1,0 +1,124 @@
+use './gateway-alert-investigator.context.ts' {
+  type GatewayAlertRecord, type AlertReceived, type Stamped, type WorkspaceReady,
+  type AgentReplaced, type AttemptFailed, type RecoveryDelivered, type RecoveryFailed,
+  noIncident, retryDue,
+  openIncident, refreshAlert, restartAttempt, recordWorkspace, failAttempt,
+  beginRecovery, recordRecovery
+}
+
+// One gateway alert incident. The host runs each step's side effect (start
+// Herdr, open a workspace, start the agent, prompt it) and reports the result
+// as the next event. Every event carries the host's clock reading as `now`.
+machine gatewayAlertInvestigator {
+  context: GatewayAlertRecord = :noIncident
+
+  event ALERT: AlertReceived
+  event HERDR_READY: Stamped
+  event WORKSPACE_READY: WorkspaceReady
+  event AGENT_READY: Stamped
+  event PROMPT_ACCEPTED: Stamped
+  event FAILED: AttemptFailed
+  event WORKSPACE_LOST: Stamped
+  event AGENT_LOST: AgentReplaced
+  event BEGIN_RECOVERY: Stamped
+  event RECOVERY_DELIVERED: RecoveryDelivered
+  event RECOVERY_FAILED: RecoveryFailed
+
+  // No incident has been recorded yet.
+  initial state idle {
+    ALERT -> ensuringHerdr { assign :openIncident }
+  }
+
+  // The four starting steps. A repeated alert refreshes the incident and
+  // leaves the step running.
+  state ensuringHerdr {
+    ALERT -> ensuringHerdr { assign :refreshAlert }
+    HERDR_READY -> openingWorkspace { assign event.now to updatedAt }
+    FAILED -> blocked { assign :failAttempt }
+    BEGIN_RECOVERY -> recovering { assign :beginRecovery }
+  }
+  state openingWorkspace {
+    ALERT -> openingWorkspace { assign :refreshAlert }
+    WORKSPACE_READY -> startingAgent { assign :recordWorkspace }
+    FAILED -> blocked { assign :failAttempt }
+    BEGIN_RECOVERY -> recovering { assign :beginRecovery }
+  }
+  state startingAgent {
+    ALERT -> startingAgent { assign :refreshAlert }
+    AGENT_READY -> promptingAgent { assign event.now to updatedAt }
+    FAILED -> blocked { assign :failAttempt }
+    BEGIN_RECOVERY -> recovering { assign :beginRecovery }
+  }
+  state promptingAgent {
+    ALERT -> promptingAgent { assign :refreshAlert }
+    PROMPT_ACCEPTED -> investigating { assign event.now to updatedAt }
+    FAILED -> blocked { assign :failAttempt }
+    BEGIN_RECOVERY -> recovering { assign :beginRecovery }
+  }
+
+  // The agent owns the incident. On a repeated alert the host checks that the
+  // workspace and agent still exist and reports what it finds.
+  state investigating {
+    ALERT -> investigating { assign :refreshAlert }
+    WORKSPACE_LOST -> ensuringHerdr { assign event.now to updatedAt }
+    AGENT_LOST -> startingAgent {
+      assign event.agentName to agentName
+      assign event.now to updatedAt
+    }
+    BEGIN_RECOVERY -> recovering { assign :beginRecovery }
+  }
+
+  // A starting step failed. Alerts inside the back-off window change nothing.
+  state blocked {
+    ALERT {
+      if :retryDue -> ensuringHerdr { assign :restartAttempt }
+      else -> blocked
+    }
+    BEGIN_RECOVERY -> recovering { assign :beginRecovery }
+  }
+
+  // The gateway recovered and the host is asking the agent for a receipt.
+  // Herdr may have replaced the workspace while it was down.
+  state recovering {
+    WORKSPACE_READY -> recovering { assign :recordWorkspace }
+    RECOVERY_DELIVERED -> recovered { assign :recordRecovery }
+    RECOVERY_FAILED -> recoveryBlocked {
+      assign event.now to updatedAt
+      assign event.error to lastError
+    }
+    ALERT -> ensuringHerdr { assign :restartAttempt }
+  }
+  state recoveryBlocked {
+    BEGIN_RECOVERY -> recovering { assign :beginRecovery }
+    ALERT -> ensuringHerdr { assign :restartAttempt }
+  }
+
+  // The incident is closed. The next alert opens a new one.
+  state recovered {
+    ALERT -> ensuringHerdr { assign :openIncident }
+  }
+
+  law every_state_is_reachable { can reach every state }
+
+  law every_state_can_restart { every state can reach ensuringHerdr }
+
+  law failures_block { ^FAILED only to blocked }
+
+  law investigation_follows_prompt { ^PROMPT_ACCEPTED precedes investigating }
+
+  law recovery_needs_receipt { ^RECOVERY_DELIVERED precedes recovered }
+
+  law blocked_retries_when_due {
+    no path(blocked -> ^ALERT[:retryDue] -> blocked)
+  }
+
+  law blocked_alert_can_wait { ^ALERT loops on blocked }
+
+  law alert_restarts_blocked_recovery {
+    some path(recoveryBlocked -> ^ALERT -> ensuringHerdr)
+  }
+
+  law recovery_interrupts_investigation {
+    some path(investigating -> ^BEGIN_RECOVERY -> recovering)
+  }
+}

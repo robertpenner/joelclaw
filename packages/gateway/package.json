@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "bun --watch src/daemon.ts",
     "start": "bun run src/daemon.ts",
-    "start:transport-slim": "GATEWAY_TRANSPORT_SLIM_DOWN=1 bun run src/transport-daemon.ts"
+    "start:transport-slim": "GATEWAY_TRANSPORT_SLIM_DOWN=1 bun run src/transport-daemon.ts",
+    "lucy:gen": "bun scripts/lucy.ts",
+    "lucy:check": "bun scripts/lucy.ts --check"
   },
   "dependencies": {
     "@chat-adapter/discord": "4.34.0",
