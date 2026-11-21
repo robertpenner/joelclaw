@@ -321,7 +321,7 @@ This keeps gateway automation hooks out of normal interactive pi sessions.
 | `packages/gateway/src/channels/telegram.ts` | Telegram bot channel |
 | `packages/gateway/src/command-queue.ts` | Serial FIFO queue → `session.prompt()` |
 | `packages/gateway/src/heartbeat.ts` | Periodic autonomous task runner |
-| `packages/gateway/src/gateway-alert-investigator.ts` | XState incident lifecycle and default-Herdr DGX GLM launcher |
+| `packages/gateway/src/gateway-alert-investigator.ts` | Incident host and default-Herdr DGX GLM launcher; the lifecycle is the Lucy machine in `gateway-alert-investigator.lucy` |
 | `infra/gateway-tripwire.sh` | Five-minute heartbeat sensor and investigator dispatch |
 | `packages/system-bus/src/inngest/middleware/gateway.ts` | Middleware injecting `gateway` context |
 | `packages/cli/src/commands/gateway.ts` | CLI subcommands |

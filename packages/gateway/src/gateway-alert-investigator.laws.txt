@@ -1,0 +1,112 @@
+gateway-alert-investigator.lucy: 10 configurations, 10 reachable from the initial one
+All 10 states can be entered from startup.
+law every_state_is_reachable: proven
+  every state: state idle proven, state ensuringHerdr proven, state openingWorkspace proven, state startingAgent proven, state promptingAgent proven, state investigating proven, state blocked proven, state recovering proven, state recoveryBlocked proven, state recovered proven
+  state idle: proven
+    initial configuration idle
+  state ensuringHerdr: proven
+    witness from search, starting at idle:
+      ^ALERT -> ensuringHerdr
+  state openingWorkspace: proven
+    witness from search, starting at idle:
+      ^ALERT -> ensuringHerdr
+      ^HERDR_READY -> openingWorkspace
+  state startingAgent: proven
+    witness from search, starting at idle:
+      ^ALERT -> ensuringHerdr
+      ^HERDR_READY -> openingWorkspace
+      ^WORKSPACE_READY -> startingAgent
+  state promptingAgent: proven
+    witness from search, starting at idle:
+      ^ALERT -> ensuringHerdr
+      ^HERDR_READY -> openingWorkspace
+      ^WORKSPACE_READY -> startingAgent
+      ^AGENT_READY -> promptingAgent
+  state investigating: proven
+    witness from search, starting at idle:
+      ^ALERT -> ensuringHerdr
+      ^HERDR_READY -> openingWorkspace
+      ^WORKSPACE_READY -> startingAgent
+      ^AGENT_READY -> promptingAgent
+      ^PROMPT_ACCEPTED -> investigating
+  state blocked: proven
+    witness from search, starting at idle:
+      ^ALERT -> ensuringHerdr
+      ^FAILED -> blocked
+  state recovering: proven
+    witness from search, starting at idle:
+      ^ALERT -> ensuringHerdr
+      ^BEGIN_RECOVERY -> recovering
+  state recoveryBlocked: proven
+    witness from search, starting at idle:
+      ^ALERT -> ensuringHerdr
+      ^BEGIN_RECOVERY -> recovering
+      ^RECOVERY_FAILED -> recoveryBlocked
+  state recovered: proven
+    witness from search, starting at idle:
+      ^ALERT -> ensuringHerdr
+      ^BEGIN_RECOVERY -> recovering
+      ^RECOVERY_DELIVERED -> recovered
+law every_state_can_restart: proven
+  every state: state idle proven, state ensuringHerdr proven, state openingWorkspace proven, state startingAgent proven, state promptingAgent proven, state investigating proven, state blocked proven, state recovering proven, state recoveryBlocked proven, state recovered proven
+  depends on guard outcomes: :retryDue passes
+  state idle: proven
+    witness from search, starting at idle:
+      ^ALERT -> ensuringHerdr
+  state ensuringHerdr: proven
+    witness from search, starting at ensuringHerdr:
+  state openingWorkspace: proven
+    witness from search, starting at openingWorkspace:
+      ^FAILED -> blocked
+      ^ALERT -> ensuringHerdr  (assumes :retryDue passes)
+  state startingAgent: proven
+    witness from search, starting at startingAgent:
+      ^FAILED -> blocked
+      ^ALERT -> ensuringHerdr  (assumes :retryDue passes)
+  state promptingAgent: proven
+    witness from search, starting at promptingAgent:
+      ^PROMPT_ACCEPTED -> investigating
+      ^WORKSPACE_LOST -> ensuringHerdr
+  state investigating: proven
+    witness from search, starting at investigating:
+      ^WORKSPACE_LOST -> ensuringHerdr
+  state blocked: proven
+    witness from search, starting at blocked:
+      ^ALERT -> ensuringHerdr  (assumes :retryDue passes)
+  state recovering: proven
+    witness from search, starting at recovering:
+      ^ALERT -> ensuringHerdr
+  state recoveryBlocked: proven
+    witness from search, starting at recoveryBlocked:
+      ^ALERT -> ensuringHerdr
+  state recovered: proven
+    witness from search, starting at recovered:
+      ^ALERT -> ensuringHerdr
+law failures_block: proven
+  every edge on the event was checked
+  4 edges on the event checked
+law investigation_follows_prompt: proven
+  product: 30 vertices
+  the closure checker accepted the search set on the product
+  closed set from search: idle:0 ensuringHerdr:1 openingWorkspace:1 startingAgent:1 promptingAgent:1 investigating:2 blocked:1 recovering:1 recoveryBlocked:1 recovered:1
+law recovery_needs_receipt: proven
+  product: 30 vertices
+  the closure checker accepted the search set on the product
+  closed set from search: idle:0 ensuringHerdr:1 openingWorkspace:1 startingAgent:1 promptingAgent:1 investigating:1 blocked:1 recovering:1 recoveryBlocked:1 recovered:2
+law blocked_retries_when_due: proven
+  the one-transition scan found no matching edge
+  31 edges on the event checked
+law due_retry_restarts_herdr: proven
+  the one-transition scan found this edge
+  depends on guard outcomes: :retryDue passes
+  edge blocked ^ALERT -> ensuringHerdr
+law blocked_alert_can_wait: proven
+  this edge starts and ends in the same configuration
+  depends on guard outcomes: :retryDue fails
+  edge blocked ^ALERT -> blocked
+law alert_restarts_blocked_recovery: proven
+  the one-transition scan found this edge
+  edge recoveryBlocked ^ALERT -> ensuringHerdr
+law recovery_interrupts_investigation: proven
+  the one-transition scan found this edge
+  edge investigating ^BEGIN_RECOVERY -> recovering

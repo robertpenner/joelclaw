@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { readFile, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   GatewayAlertInvestigator,
@@ -38,6 +38,7 @@ async function harness() {
   let launchctlReady = true;
   let modelReady = true;
   let modelProbeDelayMs = 0;
+  let duringModelProbe: (() => Promise<void>) | undefined;
   let workspaceSequence = 0;
   let now = new Date("2026-09-10T18:00:00.000Z");
 
@@ -136,6 +137,7 @@ async function harness() {
     commandRunner: run,
     modelProbe: async () => {
       now = new Date(now.getTime() + modelProbeDelayMs);
+      await duringModelProbe?.();
       if (!modelReady) throw new Error("dgx-glm model probe timed out");
     },
     insideHerdr: false,
@@ -163,11 +165,18 @@ async function harness() {
     setModelProbeDelay(milliseconds: number) {
       modelProbeDelayMs = milliseconds;
     },
+    onModelProbe(hook: () => Promise<void>) {
+      duringModelProbe = hook;
+    },
     makeNextWorkspaceReceiptMalformed() {
       malformedWorkspaceCreateOnce = true;
     },
     failNextRecoveryPrompt() {
       failRecoveryPromptOnce = true;
+    },
+    async writeState(value: unknown): Promise<void> {
+      await mkdir(dirname(statePath), { recursive: true });
+      await writeFile(statePath, JSON.stringify(value));
     },
     async state(): Promise<GatewayAlertIncident> {
       return JSON.parse(await readFile(statePath, "utf8")) as GatewayAlertIncident;
@@ -365,6 +374,53 @@ describe("GatewayAlertInvestigator", () => {
     expect(blocked.incident?.lastError).toContain("Could not start default Herdr");
     expect(stillBlocked.action).toBe("blocked");
     expect(tested.commands).toHaveLength(commandCount);
+  });
+
+  test("persists a repeated alert before the current starting step runs", async () => {
+    const tested = await harness();
+    await tested.writeState({
+      version: 1,
+      phase: "startingAgent",
+      incidentId: "x",
+      kind: "missing",
+      ageSeconds: 90,
+      attempt: 1,
+      attemptStartedAt: "2026-09-10T17:55:00.000Z",
+      updatedAt: "2026-09-10T17:55:00.000Z",
+      workspaceId: "w1",
+      paneId: "w1:p1",
+      agentName: "gateway_alert_x",
+    });
+    tested.setModelReady(false);
+    let storedDuringProbe: GatewayAlertIncident | undefined;
+    tested.onModelProbe(async () => {
+      storedDuringProbe = await tested.state();
+    });
+
+    const result = await tested.investigator.alert("stale", 300);
+
+    expect(storedDuringProbe).toMatchObject({
+      phase: "startingAgent",
+      incidentId: "x",
+      kind: "stale",
+      ageSeconds: 300,
+      updatedAt: "2026-09-10T18:00:00.000Z",
+    });
+    expect(result).toMatchObject({
+      action: "blocked",
+      incident: { phase: "blocked", incidentId: "x", kind: "stale", ageSeconds: 300 },
+    });
+  });
+
+  test("refuses a stored incident whose phase the machine does not know", async () => {
+    const tested = await harness();
+    await tested.writeState({ version: 1, phase: "paused", incidentId: "x", attempt: 1 });
+
+    await expect(tested.investigator.alert("missing")).rejects.toThrow(
+      "Unsupported gateway alert state",
+    );
+    await expect(tested.investigator.recover()).rejects.toThrow("Unsupported gateway alert state");
+    expect(tested.commands).toHaveLength(0);
   });
 
   test("restarts a dead investigator in the existing incident workspace", async () => {

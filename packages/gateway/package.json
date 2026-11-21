@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "bun --watch src/daemon.ts",
     "start": "bun run src/daemon.ts",
-    "start:transport-slim": "GATEWAY_TRANSPORT_SLIM_DOWN=1 bun run src/transport-daemon.ts"
+    "start:transport-slim": "GATEWAY_TRANSPORT_SLIM_DOWN=1 bun run src/transport-daemon.ts",
+    "lucy:gen": "bun scripts/lucy.ts",
+    "lucy:check": "bun scripts/lucy.ts --check"
   },
   "dependencies": {
     "@chat-adapter/discord": "4.34.0",
@@ -36,7 +38,8 @@
     "remark-gfm": "^4.0.1",
     "remark-parse": "^11.0.0",
     "unified": "^11.0.5",
-    "xstate": "5.31.1"
+    "xstate": "5.31.1",
+    "xstate-v6": "npm:xstate@6.0.0-beta.3"
   },
   "devDependencies": {
     "@types/bun": "latest",
