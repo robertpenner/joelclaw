@@ -4,15 +4,25 @@ This log records the migration of gateway XState machines to Lucy statecharts.
 It keeps two lists: what the migration changed or uncovered in each machine,
 and what Lucy's language and tooling should improve.
 
-Lucy lives in a private repository. The generated `.machine.ts` files are
-checked in and import only their `.context.ts` module, so the gateway runs and
-type-checks without Lucy. Regenerating them or rechecking laws needs a penner
-checkout:
+Lucy lives in a private repository. Each machine is generated twice from its
+`.lucy` source, and both outputs are checked in:
+
+- `.machine.ts` is an XState v6 FSM built with `createFSM` from
+  `xstate-v6/fsm`. The gateway installs XState 6 under that npm alias
+  (`xstate-v6: npm:xstate@6.0.0-beta.3`) beside its XState 5 dependency.
+- `.native.ts` is a dependency-free module with the same
+  `getInitialSnapshot()` and `transition(snapshot, event)` interface. The host
+  runs this one.
+
+Both import only their `.context.ts` module, so the gateway runs and
+type-checks without Lucy. The machine tests run every case against both
+modules. Formatting the `.lucy` source, regenerating, or rechecking laws needs
+a penner checkout:
 
 ```sh
 cd packages/gateway
-LUCY_HOME=/path/to/penner bun run lucy:gen    # rewrite .machine.ts and .laws.txt
-LUCY_HOME=/path/to/penner bun run lucy:check  # fail if stale or a law is unproven
+LUCY_HOME=/path/to/penner bun run lucy:gen    # format .lucy, rewrite .machine.ts, .native.ts and .laws.txt
+LUCY_HOME=/path/to/penner bun run lucy:check  # fail if unformatted, stale, or a law is unproven
 ```
 
 `LUCY_HOME` defaults to a `penner` checkout beside the joelclaw checkout. No
@@ -27,7 +37,8 @@ The machine moved from an inline `createMachine` in
 | --------------------------------------- | ---------------------------------------------------------- |
 | `gateway-alert-investigator.lucy`       | States, events, assignments and laws                       |
 | `gateway-alert-investigator.context.ts` | Incident record, event payloads, the guard and the patches |
-| `gateway-alert-investigator.machine.ts` | Generated with `--target ts-native`; do not edit           |
+| `gateway-alert-investigator.machine.ts` | Generated XState v6 FSM; do not edit                       |
+| `gateway-alert-investigator.native.ts`  | Generated with `--target ts-native`; do not edit           |
 | `gateway-alert-investigator.laws.txt`   | Generated law report                                       |
 | `gateway-alert-investigator.ts`         | Host: Herdr commands, file lock, persistence, telemetry    |
 
@@ -208,6 +219,15 @@ added to catch them.
   retargets transitions, drops handlers and drops guard branches, then reports
   which mutants no law refutes, would have found the two missing `some path`
   laws automatically.
+- **A formatter on the compiler CLI.** The formatter is
+  `vscode/formattingCli.ts`, a script inside the VS Code extension's directory,
+  while compiling and law checking go through `statechart/main.ts`. A
+  `main.ts --format [--check]` would put every command a project needs behind
+  one entry point.
+- **The XState v6 import specifier is fixed.** The default target always
+  imports `xstate-v6/fsm`, which is penner's npm alias. Another project must
+  install XState 6 under exactly that name. An option to emit `xstate/fsm`, for
+  a project whose only XState is version 6, would remove the alias.
 - **A distributable compiler.** Lucy is unpublished and its repository is
   private, so a public repository cannot run `lucy:check` in CI. A published
   CLI package would let hosted CI catch a stale generated module.
