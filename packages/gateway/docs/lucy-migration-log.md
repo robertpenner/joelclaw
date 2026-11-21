@@ -112,11 +112,15 @@ the phase against a `Record<GatewayAlertPhase, true>`, which the compiler keeps
 in sync with the machine's states, and throws `Unsupported gateway alert state`.
 A host test covers this.
 
-**Behavior change: a repeated alert during a starting step is persisted at
-once.** The old host merged the refreshed fields in memory and wrote them with
-the next transition. The new host writes them when `ALERT` is handled. The
-final stored incident is the same unless the process dies during the step's
-side effect, in which case the refreshed fields now survive.
+**Behavior change: a repeated alert is persisted before the host acts on it.**
+In a starting step, the old host merged the refreshed `kind`, `ageSeconds` and
+`updatedAt` in memory and wrote them with the next transition. In
+`investigating`, it held them in memory through the workspace and agent probes
+and wrote them once at the end. The new host writes them as soon as `ALERT` is
+handled, before the step's side effect or the probes run. The final stored
+incident is the same unless the process dies in between, in which case the
+refreshed fields now survive. A host test reads the stored incident during the
+model probe to check this.
 
 **Open question: recovery skips the back-off window.** The first version of the
 retry law,
@@ -126,11 +130,24 @@ was refuted. From `blocked`, `BEGIN_RECOVERY` clears `retryAfter`, and an
 the original back-off window. The old host behaves the same way. The law now
 covers only the direct case, `no path(blocked -> ^ALERT[:retryDue] -> blocked)`.
 Whether an alert after a recovery attempt should honor the earlier back-off
-needs a decision from the gateway owner.
+needs a decision from the gateway owner. `recovered` is outside the question:
+an alert there opens a new incident, and `openIncident` never consults
+`retryDue`.
+
+If the answer is yes, the machine change alone is not enough.
+`beginRecovery` would keep `retryAfter`, and `ALERT` in `recovering` and
+`recoveryBlocked` would take the `retryDue` guard. The host decides what to do
+after `ALERT` by phase: it returns early only for `blocked`, handles
+`investigating`, and passes everything else to `advance()`. An `else` branch
+that stays in `recovering` or `recoveryBlocked` would reach `advance()`, which
+throws `Cannot advance`. The host would then send `FAILED`, which those states
+ignore, and emit failure telemetry for an alert that was correctly deferred.
+Either the `else` branch targets `blocked`, or `alert()` returns early for the
+two recovery phases.
 
 ### Laws and mutation testing
 
-The machine has nine laws, all proven:
+The machine has ten laws, all proven:
 
 | Law                                 | Statement                                                   |
 | ----------------------------------- | ----------------------------------------------------------- |
@@ -140,6 +157,7 @@ The machine has nine laws, all proven:
 | `investigation_follows_prompt`      | `^PROMPT_ACCEPTED precedes investigating`                   |
 | `recovery_needs_receipt`            | `^RECOVERY_DELIVERED precedes recovered`                    |
 | `blocked_retries_when_due`          | `no path(blocked -> ^ALERT[:retryDue] -> blocked)`          |
+| `due_retry_restarts_herdr`          | `some path(blocked -> ^ALERT[:retryDue] -> ensuringHerdr)`  |
 | `blocked_alert_can_wait`            | `^ALERT loops on blocked`                                   |
 | `alert_restarts_blocked_recovery`   | `some path(recoveryBlocked -> ^ALERT -> ensuringHerdr)`     |
 | `recovery_interrupts_investigation` | `some path(investigating -> ^BEGIN_RECOVERY -> recovering)` |
@@ -150,6 +168,8 @@ law fails when the machine is wrong:
 | Mutation                                 | Refuted by                                                 |
 | ---------------------------------------- | ---------------------------------------------------------- |
 | A due retry stays in `blocked`           | `blocked_retries_when_due`                                 |
+| A due retry goes to `openingWorkspace`   | `due_retry_restarts_herdr`                                 |
+| A due retry goes to `recovering`         | `due_retry_restarts_herdr`                                 |
 | `FAILED` goes to `ensuringHerdr`         | `failures_block`                                           |
 | `AGENT_READY` skips `promptingAgent`     | `every_state_is_reachable`, `investigation_follows_prompt` |
 | `RECOVERY_FAILED` goes to `recovered`    | `every_state_is_reachable`, `recovery_needs_receipt`       |
@@ -159,9 +179,11 @@ law fails when the machine is wrong:
 | `recoveryBlocked` ignores `ALERT`        | `alert_restarts_blocked_recovery`                          |
 | `investigating` ignores `BEGIN_RECOVERY` | `recovery_interrupts_investigation`                        |
 
-The last two mutations survived the first seven laws, because both states could
-still reach their targets through other events. The two `some path` laws were
-added to catch them.
+Four of these mutations passed every law until a `some path` law was added for
+them. `blocked_retries_when_due` only forbids a due retry from staying in
+`blocked`, so sending it to `openingWorkspace` or `recovering` passed.
+`recoveryBlocked` and `investigating` could still reach their targets through
+other events, so removing their `ALERT` or `BEGIN_RECOVERY` handler passed too.
 
 ## Suggested improvements to Lucy
 
