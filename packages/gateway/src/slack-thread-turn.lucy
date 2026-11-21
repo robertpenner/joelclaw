@@ -1,0 +1,64 @@
+use './slack-thread-turn.context.ts' {
+  type SlackThreadTurnRecord, type TurnEvent,
+  noTurn, sameTurn, claimTurn
+}
+
+// The Slack message a thread's Pi session is answering. The host claims the
+// message, launches the agent, and records the result. Events for any other
+// message are ignored, so one message is answered at a time.
+machine slackThreadTurn {
+  context: SlackThreadTurnRecord = :noTurn
+
+  event CLAIM: TurnEvent
+  event LAUNCHED: TurnEvent
+  event COMPLETED: TurnEvent
+
+  // The thread has never had a turn.
+  initial state idle {
+    CLAIM -> claimed { assign :claimTurn }
+  }
+
+  // The message is claimed and its agent has not started yet.
+  state claimed {
+    LAUNCHED {
+      if :sameTurn -> launched { assign event.now to updatedAt }
+    }
+  }
+
+  state launched {
+    COMPLETED {
+      if :sameTurn -> completed { assign event.now to updatedAt }
+    }
+  }
+
+  // The result is recorded. A different message starts the next turn.
+  state completed {
+    CLAIM {
+      if not :sameTurn -> claimed { assign :claimTurn }
+    }
+  }
+
+  law every_state_is_reachable {
+    can reach every state
+  }
+
+  law every_turn_can_complete {
+    every state can reach completed
+  }
+
+  law launch_follows_claim {
+    every path(idle --> launched) includes claimed
+  }
+
+  law completion_follows_launch {
+    every path(idle --> completed) includes launched
+  }
+
+  law one_turn_in_flight {
+    every path(claimed --> claimed) includes completed
+  }
+
+  law completed_turn_accepts_next {
+    some path(completed -> ^CLAIM -> claimed)
+  }
+}

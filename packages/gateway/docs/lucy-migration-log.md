@@ -185,6 +185,151 @@ them. `blocked_retries_when_due` only forbids a due retry from staying in
 `recoveryBlocked` and `investigating` could still reach their targets through
 other events, so removing their `ALERT` or `BEGIN_RECOVERY` handler passed too.
 
+## slackThreadSession
+
+The registry in `slack-thread-session.ts` tracked two things for each Slack
+thread: the session's status, through an inline XState machine, and the turn
+being answered, through `currentTurn.state`, which no machine described. They
+are now two Lucy machines, and the registry stores both snapshots in the
+existing `{ version: 1, sessions }` file:
+
+| File                              | Role                                                    |
+| --------------------------------- | ------------------------------------------------------- |
+| `slack-thread-session.lucy`       | Session states, events, assignments and laws            |
+| `slack-thread-session.context.ts` | Session record, event payloads, guards and patches      |
+| `slack-thread-turn.lucy`          | Turn states, events, assignments and laws               |
+| `slack-thread-turn.context.ts`    | Turn record, event payload, the guard and the patch     |
+| `*.xstate.machine.ts`             | Generated XState v6 FSMs; do not edit                   |
+| `*.native.machine.ts`             | Generated with `--target ts-native`; do not edit        |
+| `*.laws.txt`                      | Generated law reports                                   |
+| `slack-thread-session.ts`         | Host: binding check, file lock, stored form, public API |
+
+The stored form is unchanged. `status` is the session machine's state;
+`untracked` is never stored, because a thread without a record is untracked.
+`currentTurn` holds the turn machine's state and context; `idle` is stored as
+no `currentTurn`. The registry's methods and their signatures are unchanged
+except that `currentTurn.state` no longer includes `"delivered"`, which nothing
+ever wrote. The unused `slackThreadSessionMachine` export is gone.
+
+Every method now reads the thread, sends one event to one machine, and writes
+the result inside the file lock. Nothing is written when the machine ignores
+the event.
+
+### What the migration changed or uncovered
+
+**Methods wrote their patch even when the machine ignored the event.** Each
+method computed the next status with XState and merged its own field patch
+regardless of whether XState took a transition. `resolve` on a retired thread
+set `retireAfter`, `attachRuntime` on a retired thread recorded a pane, and
+`settle` outside `running` changed `updatedAt`. The patches now belong to the
+handlers, so an ignored event changes nothing and the host skips the write.
+
+**Concurrent calls could store an impossible thread.** Each method read the
+thread before taking the file lock and computed its status from that read.
+When `resolve` and `settle` ran together on a running thread, `settle` computed
+`neutral` from its stale read and wrote it over `resolve`'s result. The thread
+ended `neutral` with a `retireAfter`, and `retireDue` skips threads that are
+not `resolving`, so it would never retire. The new test
+`concurrent calls each see the other's result` reproduces this against the old
+registry.
+
+**Reactivating a retired thread kept the old session's runtime and turn.**
+`activate` built a fresh session for a retired thread, but `update()` merged it
+over the stored record. The "new" session kept the old `sessionId`, `paneId`,
+`workspaceId`, planned session, `retireAfter` and `currentTurn`. The plugin
+reuses `sessionId` and `paneId` when they are present, and a turn left in
+`launched` made every later `claimTurn` throw. In the machine, `ACTIVATE` in
+`retired` applies `openSession`, which clears every optional field, and the
+host resets the turn to `idle`.
+
+**Turn steps were not ordered.** `markTurnLaunched` and `completeTurn` checked
+only that the `sourceEventId` matched, so a turn could be completed before it
+was launched, or launched again after it completed. The turn machine accepts
+`LAUNCHED` only in `claimed` and `COMPLETED` only in `launched`. Repeating the
+step a turn has already taken still succeeds, because the plugin's `read` tool
+can be retried for the same message.
+
+**Two bindings shaped one state.** `neutral` never has a binding and `bound`
+always does, and a binding is never removed. The old host chose between
+`SETTLE_BOUND` and `SETTLE_NEUTRAL` (and the two `HUMAN_REPLY_*` events) by
+checking `binding` itself. The machine has one `SETTLE` and one `HUMAN_REPLY`,
+and the `hasBinding` guard chooses the target.
+
+**`retireDue` sends `RETIRE` to every session.** The quiet-time check moved
+into the `quietOver` guard, and `retireDue` returns the sessions that the
+machine moved to `retired`.
+
+**Behavior changes for callers:**
+
+- `settle`, `resolve`, `attachPlan` and `attachRuntime` no longer write when
+  the session's status does not accept their event. They return the stored
+  session unchanged.
+- `markTurnLaunched` and `completeTurn` throw for a step out of order, naming
+  the turn's current state.
+- Turn calls update the turn's `updatedAt` and no longer the session's.
+- `get` and the other readers throw `Unsupported Slack thread session state`
+  for a stored status or turn state the machines do not have.
+
+### Open questions for the owner
+
+- **A stuck turn blocks its thread.** A turn left in `claimed` or `launched`,
+  for example after a crash, makes `claimTurn` throw for every new message in
+  that thread. Neither the old registry nor the new one has a way to abandon a
+  turn. An `ABANDON` event or a timeout would need a decision about what to do
+  with the agent that may still be running.
+- **A resolving thread can start a turn.** The plugin's `runTurn` calls
+  `activate` but not `noteHumanReply`, and `ACTIVATE` keeps a resolving thread
+  in `resolving`. `START` there records the runtime without leaving
+  `resolving`, as before, so `retireDue` can retire the thread while that turn
+  runs. The daemon calls `noteHumanReply` for follow-ups, which avoids this on
+  its path.
+
+### Laws and mutation testing
+
+The session machine has nine laws and the turn machine six, all proven:
+
+| Law                           | Statement                                                |
+| ----------------------------- | -------------------------------------------------------- |
+| **slackThreadSession**        |                                                          |
+| `every_state_is_reachable`    | `can reach every state`                                  |
+| `every_thread_can_run_again`  | `every state can reach running`                          |
+| `retirement_needs_resolve`    | `^RESOLVE precedes retired`                              |
+| `only_resolving_retires`      | `^RETIRE only from resolving`                            |
+| `quiet_time_over_retires`     | `some path(resolving -> ^RETIRE[:quietOver] -> retired)` |
+| `early_retire_waits`          | `^RETIRE loops on resolving`                             |
+| `reply_reopens`               | `no path(resolving -> ^HUMAN_REPLY -> resolving)`        |
+| `settle_ends_turn`            | `no path(running -> ^SETTLE -> running)`                 |
+| `untracked_only_at_start`     | `no path(to untracked)`                                  |
+| **slackThreadTurn**           |                                                          |
+| `every_state_is_reachable`    | `can reach every state`                                  |
+| `every_turn_can_complete`     | `every state can reach completed`                        |
+| `launch_follows_claim`        | `every path(idle --> launched) includes claimed`         |
+| `completion_follows_launch`   | `every path(idle --> completed) includes launched`       |
+| `one_turn_in_flight`          | `every path(claimed --> claimed) includes completed`     |
+| `completed_turn_accepts_next` | `some path(completed -> ^CLAIM -> claimed)`              |
+
+Each mutation below was applied to a copy of a `.lucy` file:
+
+| Mutation                                        | Refuted by                                            |
+| ----------------------------------------------- | ----------------------------------------------------- |
+| A due `RETIRE` stays in `resolving`             | `every_state_is_reachable`, `quiet_time_over_retires` |
+| An early `RETIRE` goes to `retired`             | `early_retire_waits`                                  |
+| `SETTLE` stays in `running`                     | `settle_ends_turn`                                    |
+| `HUMAN_REPLY` stays in `resolving`              | `reply_reopens`                                       |
+| `retired` ignores `ACTIVATE`                    | `every_thread_can_run_again`                          |
+| `retired` goes to `untracked` on `ACTIVATE`     | `untracked_only_at_start`                             |
+| `bound` accepts `RETIRE`                        | `retirement_needs_resolve`, `only_resolving_retires`  |
+| `running` accepts `RETIRE`                      | `retirement_needs_resolve`, `only_resolving_retires`  |
+| `claimed` accepts `CLAIM`                       | `one_turn_in_flight`                                  |
+| `launched` accepts `CLAIM`                      | `one_turn_in_flight`                                  |
+| `claimed` accepts `COMPLETED`                   | `completion_follows_launch`                           |
+| `completed` ignores `CLAIM`                     | `completed_turn_accepts_next`                         |
+| `CLAIM` from `idle` goes straight to `launched` | `launch_follows_claim`                                |
+
+The ordering of turn steps and the one-turn-at-a-time rule were checks
+scattered through three methods. They are now the laws `launch_follows_claim`,
+`completion_follows_launch` and `one_turn_in_flight`.
+
 ## Suggested improvements to Lucy
 
 ### Language
@@ -205,7 +350,9 @@ other events, so removing their `ALERT` or `BEGIN_RECOVERY` handler passed too.
   `FAILED` and `BEGIN_RECOVERY` handlers. A compound parent would hold them
   once, but `ts-native` accepts only flat machines. A named handler that several
   states could reference would remove the repetition in flat machines. Handler
-  constants today are values local to one handler.
+  constants today are values local to one handler. `slackThreadSession` repeats
+  its `ACTIVATE`, `PLAN` and `HUMAN_REPLY` handlers in up to four states for
+  the same reason.
 - **Computed `after` delays.** (From the survey of the other gateway machines.)
   `signalLifecycle` computes its snooze delay from context, and `after` accepts
   only literal durations.
@@ -228,6 +375,12 @@ other events, so removing their `ALERT` or `BEGIN_RECOVERY` handler passed too.
 - **Unknown states.** `transition` has no default case, so a snapshot with an
   unknown `value` returns `undefined` instead of failing with a message that
   names the state.
+- **Accepted versus ignored events.** An ignored event and an accepted one
+  that changes nothing (an `else` branch with no assignment, such as an early
+  `RETIRE`) both return the same snapshot object. The session host does not
+  need the difference, but `markTurnLaunched` has to tell "already launched"
+  from "out of order" by inspecting the state itself. A `can(snapshot, event)`
+  function, or a flag in the result, would answer that directly.
 
 ### Law checker and tooling
 
