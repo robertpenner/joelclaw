@@ -39,7 +39,6 @@ function at(value: Phase, context: Partial<GatewayAlertRecord> = {}): Snapshot {
   };
 }
 
-
 const alert = (
   now: string,
   incidentId = "22222222-2222-2222-2222-222222222222",
@@ -91,6 +90,95 @@ describe.each(machines)("gatewayAlertInvestigator machine (%s)", (_target, machi
     const next = send(at("openingWorkspace"), { ...alert(t1), ageSeconds: 120 });
     expect(next.value).toBe("openingWorkspace");
     expect(next.context).toEqual({ ...record, kind: "stale", ageSeconds: 120, updatedAt: t1 });
+  });
+
+  test("a repeated alert without an age keeps the stored age", () => {
+    const next = send(at("startingAgent"), alert(t1));
+    expect(next.value).toBe("startingAgent");
+    expect(next.context).toEqual({ ...record, kind: "stale", updatedAt: t1 });
+  });
+
+  test("each starting step's success moves to the next step and stamps the incident", () => {
+    const steps: [Phase, Event, Phase][] = [
+      ["ensuringHerdr", { type: "HERDR_READY", now: t1 }, "openingWorkspace"],
+      ["startingAgent", { type: "AGENT_READY", now: t1 }, "promptingAgent"],
+      ["promptingAgent", { type: "PROMPT_ACCEPTED", now: t1 }, "investigating"],
+    ];
+    for (const [from, event, to] of steps) {
+      const next = send(at(from), event);
+      expect(next.value).toBe(to);
+      expect(next.context).toEqual({ ...record, updatedAt: t1 });
+    }
+  });
+
+  test("a lost workspace restarts from Herdr; a lost agent restarts it under a new name", () => {
+    const investigating = at("investigating", { workspaceId: "w1", paneId: "p1" });
+    const lostWorkspace = send(investigating, { type: "WORKSPACE_LOST", now: t1 });
+    expect(lostWorkspace.value).toBe("ensuringHerdr");
+    expect(lostWorkspace.context).toEqual({ ...investigating.context, updatedAt: t1 });
+
+    const lostAgent = send(investigating, {
+      type: "AGENT_LOST",
+      agentName: "gateway_alert_replacement",
+      now: t1,
+    });
+    expect(lostAgent.value).toBe("startingAgent");
+    expect(lostAgent.context).toEqual({
+      ...investigating.context,
+      agentName: "gateway_alert_replacement",
+      updatedAt: t1,
+    });
+  });
+
+  test("a recovery receipt closes the incident; a failed delivery blocks recovery", () => {
+    const recovering = at("recovering", { lastError: "earlier" });
+    const delivered = send(recovering, { type: "RECOVERY_DELIVERED", recoveredAt: t1, now: t2 });
+    expect(delivered.value).toBe("recovered");
+    expect(delivered.context).toEqual({
+      ...record,
+      updatedAt: t2,
+      recoveredAt: t1,
+      lastError: undefined,
+    });
+
+    const failed = send(recovering, { type: "RECOVERY_FAILED", error: "prompt failed", now: t1 });
+    expect(failed.value).toBe("recoveryBlocked");
+    expect(failed.context).toEqual({ ...record, updatedAt: t1, lastError: "prompt failed" });
+  });
+
+  test("an alert during or after a failed recovery starts the next attempt of the same incident", () => {
+    for (const phase of ["recovering", "recoveryBlocked"] as const) {
+      const next = send(at(phase, { workspaceId: "w1", lastError: "prompt failed" }), alert(t2));
+      expect(next.value).toBe("ensuringHerdr");
+      expect(next.context).toEqual({
+        ...record,
+        kind: "stale",
+        updatedAt: t2,
+        attempt: 2,
+        attemptStartedAt: t2,
+        retryAfter: undefined,
+        workspaceId: "w1",
+        lastError: undefined,
+      });
+    }
+  });
+
+  test("recovery from blocked clears the back-off window", () => {
+    const next = send(at("blocked", { retryAfter: t2, lastError: "boom" }), {
+      type: "BEGIN_RECOVERY",
+      now: t1,
+    });
+    expect(next.value).toBe("recovering");
+    expect(next.context).toEqual({
+      ...record,
+      updatedAt: t1,
+      retryAfter: undefined,
+      lastError: undefined,
+    });
+  });
+
+  test("a blocked incident with no retry time retries on the next alert", () => {
+    expect(send(at("blocked"), alert(t1)).value).toBe("ensuringHerdr");
   });
 
   test("an alert inside the back-off window leaves a blocked incident untouched", () => {
